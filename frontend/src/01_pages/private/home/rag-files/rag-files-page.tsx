@@ -45,7 +45,7 @@ const RagFilesPage = () => {
     { label: 'Description', column: 'description' },
     { label: 'Version', column: 'version' },
     { label: 'File Path', column: 'file_path' },
-    { label: 'Uploaded By', column: 'uploaded_by' },
+    { label: 'Creator', column: 'created_by' },
     { label: 'Created At', column: 'created_at', className: 'w-[200px]' },
     { label: 'Actions', className: 'w-[100px]' },
   ];

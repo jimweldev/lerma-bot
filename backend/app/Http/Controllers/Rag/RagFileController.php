@@ -71,66 +71,151 @@ class RagFileController extends Controller {
     }
 
     public function store(Request $request) {
+        ini_set('memory_limit', '-1');
         set_time_limit(0);
 
         $authUser = auth()->user();
 
         try {
             $file = $request->file('file');
+
             if (!$file) {
                 return response()->json([
                     'message' => 'No file uploaded.',
                 ], 400);
             }
 
-            // Get file extension
+            // Get extension
             $extension = strtolower($file->getClientOriginalExtension());
 
-            // Upload file
+            // Upload
             $filePath = StorageHelper::uploadFileAs($file, 'rag_files', $extension);
+
             if (!$filePath) {
                 return response()->json([
-                    'message' => "Failed to upload {$file->getClientOriginalName()}. File size too large.",
+                    'message' => "Failed to upload {$file->getClientOriginalName()}.",
                 ], 400);
             }
 
-            // Create RagFile record
+            // Save record
             $request->merge([
                 'file_path' => $filePath,
                 'created_by' => $authUser->id,
             ]);
+
             $record = RagFile::create($request->all());
 
-            // Get full file path on disk
             $fullPath = Storage::disk('public')->path($filePath);
             $content = '';
 
-            // Extract file content based on type
+            /*
+            |--------------------------------------------------------------------------
+            | TEXT FILE
+            |--------------------------------------------------------------------------
+            */
             if ($extension === 'txt') {
-                $content = file_get_contents($fullPath);
-            } elseif ($extension === 'pdf') {
-                $parser = new Parser;
-                $pdf = $parser->parseFile($fullPath);
-                $content = $pdf->getText();
-            } elseif ($extension === 'docx') {
-                $phpWord = IOFactory::load($fullPath);
-                foreach ($phpWord->getSections() as $section) {
-                    foreach ($section->getElements() as $element) {
-                        if (method_exists($element, 'getText')) {
-                            $content .= $element->getText()."\n";
-                        }
-                    }
-                }
-            } else {
-                // Fallback for other types
                 $content = file_get_contents($fullPath);
             }
 
-            // Split content into chunks and save
+            /*
+            |--------------------------------------------------------------------------
+            | PDF FILE
+            |--------------------------------------------------------------------------
+            */
+            else if ($extension === 'pdf') {
+                // Try normal extraction first
+                $parser = new Parser;
+                $pdf = $parser->parseFile($fullPath);
+                $content = $pdf->getText();
+
+                // If empty → use OCR fallback
+                if (empty(trim($content))) {
+                    $tempDir = storage_path('app/temp_ocr_'.uniqid());
+                    if (!file_exists($tempDir)) {
+                        mkdir($tempDir, 0777, true);
+                    }
+
+                    $imagePrefix = $tempDir.'/page';
+
+                    // Convert PDF to PNG images
+                    exec("pdftoppm -png \"$fullPath\" \"$imagePrefix\"");
+
+                    $images = glob($tempDir.'/page*.png');
+
+                    foreach ($images as $image) {
+                        $outputBase = $image; // Tesseract output base name
+
+                        exec("tesseract \"$image\" \"$outputBase\" -l eng");
+
+                        $textFile = $outputBase.'.txt';
+
+                        if (file_exists($textFile)) {
+                            $content .= file_get_contents($textFile)."\n";
+                            unlink($textFile);
+                        }
+
+                        unlink($image);
+                    }
+
+                    rmdir($tempDir);
+                }
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | DOCX FILE
+            |--------------------------------------------------------------------------
+            */
+            else if ($extension === 'docx') {
+                $phpWord = IOFactory::load($fullPath);
+
+                foreach ($phpWord->getSections() as $section) {
+                    foreach ($section->getElements() as $element) {
+                        if ($element instanceof \PhpOffice\PhpWord\Element\Text) {
+                            $content .= $element->getText()."\n";
+                        } elseif ($element instanceof \PhpOffice\PhpWord\Element\TextRun) {
+                            foreach ($element->getElements() as $child) {
+                                if ($child instanceof \PhpOffice\PhpWord\Element\Text) {
+                                    $content .= $child->getText();
+                                }
+                            }
+                            $content .= "\n";
+                        }
+                    }
+                }
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | FALLBACK
+            |--------------------------------------------------------------------------
+            */
+            else {
+                $content = file_get_contents($fullPath);
+            }
+
+            // Normalize whitespace
+            $content = trim(preg_replace('/\s+/', ' ', $content));
+
+            if (empty($content)) {
+                return response()->json([
+                    'message' => 'File uploaded but no readable content found.',
+                ], 400);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | CREATE CHUNKS
+            |--------------------------------------------------------------------------
+            */
             $chunkCount = RagFileChunkService::createChunks($record->id, $content);
 
-            // Automatically run the artisan command (for all unembedded chunks)
-            \Artisan::call('rag:embed');
+            /*
+            |--------------------------------------------------------------------------
+            | EMBEDDING
+            |--------------------------------------------------------------------------
+            */
+            Artisan::call('rag:embed');
 
             return response()->json([
                 'record' => $record,
